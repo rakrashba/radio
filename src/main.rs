@@ -39,24 +39,28 @@ struct Msg {
     data: String,
 }
 
+fn codec_capability() -> RTCRtpCodecCapability {
+    RTCRtpCodecCapability {
+        mime_type: MIME_TYPE_OPUS.to_owned(),
+        clock_rate: 48000,
+        channels: 2,
+        sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+        rtcp_feedback: vec![],
+    }
+}
+fn codec_parameters() -> RTCRtpCodecParameters {
+    RTCRtpCodecParameters {
+        capability: codec_capability(),
+        payload_type: 111,
+        ..Default::default()
+    }
+}
+
 async fn speakerPeerConn(data: &String, mut tx: tokio::sync::mpsc::Sender<String>) -> Result<()> {
     let offer = serde_json::from_str::<RTCSessionDescription>(data)?;
 
     let mut m = MediaEngine::default();
-    m.register_codec(
-        RTCRtpCodecParameters {
-            capability: RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_OPUS.to_owned(),
-                clock_rate: 48000,
-                channels: 2,
-                sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
-                rtcp_feedback: vec![],
-            },
-            payload_type: 111,
-            ..Default::default()
-        },
-        RTPCodecType::Audio,
-    );
+    m.register_codec(codec_parameters(), RTPCodecType::Audio);
 
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut m)?;
@@ -150,7 +154,12 @@ async fn speakerPeerConn(data: &String, mut tx: tokio::sync::mpsc::Sender<String
     };
 
     let b64 = base64::encode(serde_json::to_string(&local_desc)?);
-    tx.send(b64).await?;
+    let m = Msg {
+        ev: "answer".to_owned(),
+        data: b64,
+    };
+    let ev_str = serde_json::to_string(&m)?;
+    tx.send(ev_str).await?;
 
     Ok(())
 }
@@ -206,7 +215,7 @@ async fn main() -> Result<()> {
         .route("/", axum::routing::get(|| async { "Hello World" }))
         .route("/ws", axum::routing::get(ws_handler));
 
-    axum::Server::bind(&"127.0.0.1:3000".parse().unwrap())
+    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
         .serve(app.into_make_service())
         .await?;
 
