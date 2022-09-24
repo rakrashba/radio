@@ -128,13 +128,20 @@ struct AppState {
     speaker_conns: HashMap<String, Arc<RTCPeerConnection>>,
     listeners: HashMap<String, Arc<RTCPeerConnection>>,
     ice_candidates: HashMap<String, VecDeque<String>>,
-    ice_candidates_state: HashMap<String, bool>,
+    // ice_candidates_state: HashMap<String, bool>,
 }
 
-async fn addTrackToConn(
+async fn add_track_to_conn(
     conn: &Arc<RTCPeerConnection>,
     track: &Arc<TrackLocalStaticRTP>,
 ) -> Result<()> {
+    for sender in conn.get_senders().await.iter() {
+        if let Some(track1) = sender.track().await {
+            if track1.id() == track.id() {
+                return Ok(());
+            }
+        };
+    }
     let rtp_sender = conn
         .add_track(Arc::clone(track) as Arc<dyn TrackLocal + Send + Sync>)
         .await?;
@@ -176,13 +183,20 @@ async fn new_peer_conn_with_offer(
 
     eprintln!("sending new peer connection to be inserted");
     let sid = id.clone();
+    let (onetx, mut onerx) = tokio::sync::oneshot::channel::<bool>();
     tx_app
         .send(AppStateEv {
             action: "new-speaker".to_owned(),
-            data: AppStateEvKind::StrConn(sid, Arc::clone(&peer_conn)),
+            data: AppStateEvKind::StrConnTx(sid, Arc::clone(&peer_conn), onetx),
         })
         .await?;
     eprintln!("sent!");
+    if let Ok(v) = onerx.try_recv() {
+        if !v {
+            eprintln!("number of speakers exceeded");
+            return Err(anyhow!("num speakers exceeded"));
+        }
+    }
 
     let (local_track_chan_tx, mut local_track_chan_rx) =
         tokio::sync::mpsc::channel::<Arc<TrackLocalStaticRTP>>(1);
@@ -331,8 +345,8 @@ async fn new_peer_conn_with_offer(
                         if let Some(offer) = pc.local_description().await {
                             if let Ok(offer) = serde_json::to_string(&offer) {
                                 let msg = Msg {
-                                    ev: "speaker-offer".to_owned(),
-                                    id: id,
+                                    ev: "offer".to_owned(),
+                                    id,
                                     data: offer,
                                 };
                                 if let Ok(value) = serde_json::to_string(&msg) {
@@ -367,6 +381,144 @@ async fn new_peer_conn_with_offer(
     Ok(peer_conn)
 }
 
+async fn new_listener_with_offer(
+    id: String,
+    offer: RTCSessionDescription,
+    tx: tokio::sync::mpsc::Sender<String>,
+    tx_app: tokio::sync::mpsc::Sender<AppStateEv>,
+) -> Result<Arc<RTCPeerConnection>> {
+    eprintln!("creating new listener peer conn for: {}", id);
+
+    let mut m = MediaEngine::default();
+    for p in codec_parameters() {
+        let _ = m.register_codec(p, RTPCodecType::Audio)?;
+    }
+
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut m)?;
+
+    let api = APIBuilder::new()
+        .with_media_engine(m)
+        .with_interceptor_registry(registry)
+        .build();
+
+    let peer_conn = Arc::new(api.new_peer_connection(rtc_config()).await?);
+
+    eprintln!("sending new peer connection to be inserted");
+    let sid = id.clone();
+    tx_app
+        .send(AppStateEv {
+            action: "new-listener".to_owned(),
+            data: AppStateEvKind::StrConn(sid, Arc::clone(&peer_conn)),
+        })
+        .await?;
+    eprintln!("sent!");
+
+    eprintln!("setting up on peer connection state change handler");
+    let tx_app1 = tx_app.clone();
+    let sid = id.clone();
+    peer_conn
+        .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+            eprintln!("Listener PeerConnection State Changed: {:?}", &s);
+            match s {
+                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
+                    let _ = tx_app1.try_send(AppStateEv{
+                        action: "remove-listener".to_owned(),
+                        data: AppStateEvKind::Str(sid.clone()),
+                    });
+                },
+                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected => {
+                    let _ = tx_app1.try_send(AppStateEv{
+                        action: "remove-listener".to_owned(),
+                        data: AppStateEvKind::Str(sid.clone()),
+                    });
+                },
+                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed => {
+                    let _ = tx_app1.try_send(AppStateEv{
+                        action: "remove-listener".to_owned(),
+                        data: AppStateEvKind::Str(sid.clone()),
+                    });
+                }
+                _ => {}
+            }
+            Box::pin(async {})
+        }))
+        .await;
+
+    let sid2 = id.clone();
+    let tx1 = tx.clone();
+    eprintln!("[listener] setting up on ice candidate handler");
+    peer_conn
+        .on_ice_candidate(Box::new(move |s| {
+            let sid2 = sid2.clone();
+            let tx1 = tx1.clone();
+            tokio::spawn(async move {
+                if let Some(ice_candidate) = s {
+                    if let Ok(icc) = serde_json::to_string(&ice_candidate) {
+                        let m = Msg {
+                            ev: "ice-candidate".to_owned(),
+                            id: sid2,
+                            data: icc,
+                        };
+                        if let Ok(m) = serde_json::to_string(&m) {
+                            let _ = tx1.send(m).await;
+                        }
+                    };
+                };
+            });
+            Box::pin(async {})
+        }))
+        .await;
+    eprintln!("[listener] on ice candidate handler ready");
+
+    let pc = peer_conn.clone();
+    let tx1 = tx.clone();
+    let sid = id.clone();
+    eprintln!("[listener] setting up on negotiation needed handler");
+    peer_conn
+        .on_negotiation_needed(Box::new(move || {
+            eprintln!("[onnegotiationstate] -> fired");
+            let pc = pc.clone();
+            let tx1 = tx1.clone();
+            let id = sid.clone();
+            tokio::spawn(async move {
+                if let Ok(offer) = pc.create_offer(None).await {
+                    if pc.signaling_state()
+                        != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+                    {
+                        eprintln!("[listener] negotiation needed but state is unstable");
+                        return;
+                    }
+                    eprintln!("[onnegotiationstate] -> setting offer");
+                    if let Ok(_) = pc.set_local_description(offer).await {
+                        if let Some(offer) = pc.local_description().await {
+                            if let Ok(offer) = serde_json::to_string(&offer) {
+                                let msg = Msg {
+                                    ev: "offer".to_owned(),
+                                    id,
+                                    data: offer,
+                                };
+                                if let Ok(value) = serde_json::to_string(&msg) {
+                                    let _ = tx1.send(value).await;
+                                };
+                                println!("negotiation needed. offer set and sent to peer");
+                            };
+                        };
+                    };
+                };
+            });
+            Box::pin(async {})
+        }))
+        .await;
+    eprintln!("[listener] on negotiation needed handler ready");
+
+    eprintln!("Calling set_offer");
+    set_offer(id.clone(), &peer_conn, offer, tx.clone()).await?;
+    eprintln!("set_offer done");
+
+    Ok(peer_conn)
+}
+
 async fn set_offer(
     id: String,
     conn: &Arc<RTCPeerConnection>,
@@ -393,8 +545,8 @@ async fn set_offer(
     };
 
     let m = Msg {
-        ev: "speaker-answer".to_owned(),
-        id: id,
+        ev: "answer".to_owned(),
+        id,
         data: serde_json::to_string(&local_desc)?,
     };
     let ev_str = serde_json::to_string(&m)?;
@@ -411,7 +563,6 @@ impl AppState {
             speaker_tracks: HashMap::<String, Vec<Arc<TrackLocalStaticRTP>>>::new(),
             speaker_conns: HashMap::<String, Arc<RTCPeerConnection>>::new(),
             ice_candidates: HashMap::<String, VecDeque<String>>::new(),
-            ice_candidates_state: HashMap::<String, bool>::new(),
         }
     }
 
@@ -426,10 +577,30 @@ impl AppState {
                 continue;
             }
 
-            let _ = addTrackToConn(conn, &track).await;
+            let _ = add_track_to_conn(conn, &track).await;
             println!("Added track: {} to {}", id.clone(), id1);
         }
         Ok(())
+    }
+
+    async fn add_track_to_listeners(&self, track: Arc<TrackLocalStaticRTP>) {
+        for (id, conn) in self.listeners.iter() {
+            eprintln!("adding track to listener: {}", id);
+            let _ = add_track_to_conn(conn, &track).await;
+            eprintln!("adding track to listener: {} done", id);
+        }
+    }
+
+    async fn add_tracks_to_listener(&self, id: String) {
+        if let Some(conn) = self.listeners.get(&id) {
+            for (_, tracks) in self.speaker_tracks.iter() {
+                for track in tracks.iter() {
+                    eprintln!("adding track to listener: {}", &id);
+                    let _ = add_track_to_conn(conn, track).await;
+                    eprintln!("adding track to listener: {} done", &id);
+                }
+            }
+        }
     }
 
     async fn distribute_tracks_speaker(&self, id: String) -> Result<()> {
@@ -440,7 +611,7 @@ impl AppState {
                     continue;
                 }
                 for track in tracks.iter() {
-                    let _ = addTrackToConn(conn, &track).await;
+                    let _ = add_track_to_conn(conn, &track).await;
                     println!("added track: {} to {}", track.id(), id1);
                 }
             }
@@ -470,12 +641,30 @@ impl AppState {
         {
             self.distribute_tracks_speaker(id.clone()).await?;
         }
+        {
+            self.add_track_to_listeners(track.clone()).await;
+        }
 
         Ok(())
     }
 
     async fn add_ice_candidates(&mut self, id: &String) -> Result<()> {
         if let Some(conn) = self.speaker_conns.get(id) {
+            if let Some(iccs) = self.ice_candidates.get_mut(id) {
+                while !iccs.is_empty() {
+                    eprintln!("applying ice candidate for: {}", id);
+                    if let Some(v) = iccs.pop_front() {
+                        if let Ok(candidate) = serde_json::from_str::<RTCIceCandidateInit>(&v) {
+                            let _ = conn.add_ice_candidate(candidate).await;
+                        }
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn add_listener_ice_candidates(&mut self, id: &String) -> Result<()> {
+        if let Some(conn) = self.listeners.get(id) {
             if let Some(iccs) = self.ice_candidates.get_mut(id) {
                 while !iccs.is_empty() {
                     eprintln!("applying ice candidate for: {}", id);
@@ -496,6 +685,11 @@ enum AppStateEvKind {
     Str(String),
     StrTrack(String, Arc<TrackLocalStaticRTP>),
     StrConn(String, Arc<RTCPeerConnection>),
+    StrConnTx(
+        String,
+        Arc<RTCPeerConnection>,
+        tokio::sync::oneshot::Sender<bool>,
+    ),
     StrSDP(String, RTCSessionDescription),
     StrSDPTx(
         String,
@@ -543,10 +737,30 @@ async fn speaker_answer(msg: &Msg, ctx: Arc<Context>) -> Result<()> {
 }
 
 async fn listener_offer(
-    data: &Msg,
-    mut tx: tokio::sync::mpsc::Sender<String>,
+    msg: &Msg,
+    tx: tokio::sync::mpsc::Sender<String>,
     ctx: Arc<Context>,
 ) -> Result<()> {
+    let id = msg.id.clone();
+    let offer = serde_json::from_str::<RTCSessionDescription>(&msg.data)?;
+    ctx.tx
+        .send(AppStateEv {
+            action: "listener-offer".to_owned(),
+            data: AppStateEvKind::StrSDPTx(id, offer, tx.clone()),
+        })
+        .await?;
+    Ok(())
+}
+
+async fn listener_answer(msg: &Msg, ctx: Arc<Context>) -> Result<()> {
+    let id = msg.id.clone();
+    let answer = serde_json::from_str::<RTCSessionDescription>(&msg.data)?;
+    ctx.tx
+        .send(AppStateEv {
+            action: "listener-answer".to_owned(),
+            data: AppStateEvKind::StrSDP(id, answer),
+        })
+        .await?;
     Ok(())
 }
 
@@ -564,7 +778,7 @@ async fn new_ice_candidate(data: &Msg, ctx: Arc<Context>) -> Result<()> {
 async fn websocket(stream: WebSocket, state: Arc<Context>) {
     let (mut send, mut recv) = stream.split();
 
-    let (mut tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
     let mut send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -600,6 +814,12 @@ async fn websocket(stream: WebSocket, state: Arc<Context>) {
                             }
                         }
                     }
+                    "listener-answer" => match listener_answer(&m, state.clone()).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("ws: listener-answer failed: {}", e);
+                        }
+                    },
                     "ice-candidate" => {
                         eprintln!("new ice candidate");
                         match new_ice_candidate(&m, state.clone()).await {
@@ -614,6 +834,11 @@ async fn websocket(stream: WebSocket, state: Arc<Context>) {
             }
         }
     });
+
+    tokio::select! {
+        _ = (&mut send_task) => recv_task.abort(),
+        _ = (&mut recv_task) => send_task.abort(),
+    };
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(ctx): State<Arc<Context>>) -> impl IntoResponse {
@@ -631,18 +856,24 @@ async fn main() -> Result<()> {
         while let Some(data) = rx.recv().await {
             match data.action.as_str() {
                 "new-speaker" => {
-                    if let AppStateEvKind::StrConn(id, conn) = data.data {
+                    if let AppStateEvKind::StrConnTx(id, conn, tx) = data.data {
                         {
                             let id = id.clone();
                             let mut app_state = app_state.lock().await;
+                            if app_state.speaker_conns.len() >= 5 {
+                                let _ = tx.send(false);
+                                return;
+                            }
                             app_state.speaker_conns.insert(id, conn);
+                            let _ = tx.send(true);
                         }
                         {
                             let app_state = app_state.clone();
                             let id = id.clone();
                             tokio::spawn(async move {
                                 let app_state = app_state.clone();
-                                let mut interval = tokio::time::interval(Duration::from_millis(10));
+                                let mut interval =
+                                    tokio::time::interval(Duration::from_millis(100));
                                 let id = id.clone();
                                 loop {
                                     interval.tick().await;
@@ -704,6 +935,7 @@ async fn main() -> Result<()> {
                     if let AppStateEvKind::Str(id) = data.data {
                         eprint!("remove speaker fired for: {}", &id);
                         let mut app_state = app_state.lock().await;
+                        // Remove tracks from speakers
                         for (sid, conn) in app_state.speaker_conns.iter() {
                             if sid.eq(&id) {
                                 let _ = conn.close().await;
@@ -717,6 +949,17 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                        // From listeners
+                        for (_, conn) in app_state.listeners.iter() {
+                            for sender in conn.get_senders().await.iter() {
+                                if let Some(track) = sender.track().await {
+                                    if track.id().starts_with(&id) {
+                                        let _ = conn.remove_track(sender).await;
+                                    }
+                                };
+                            }
+                        }
+                        // Remove speakers from entry
                         if let Some(_) = app_state.speaker_conns.get(&id) {
                             app_state.speaker_conns.remove(&id);
                         }
@@ -726,27 +969,74 @@ async fn main() -> Result<()> {
                         }
                     };
                 }
-                // "listener-offer" => {
-                //     if let AppStateEvKind::StrSDPTx(id, offer, tx_ws) = data.data {
-                //         let app_state = app_state.lock().await;
-                //         if let Some(conn) = app_state.listeners.get(&id) {
-                //             let _ = set_offer(id.clone(), conn, offer, tx_ws.clone()).await;
-                //         } else {
-                //             let id = id.clone();
-                //             let tx_ws = tx_ws.clone();
-                //             let tx = tx.clone();
-                //             tokio::spawn(async move {
-                //                 let _ = new_listener_with_offer(id, offer, tx_ws, tx).await;
-                //             });
-                //         };
-                //     };
-                // }
-                // "listener-answer" => {
-
-                // }
-                // "new-listener" => {
-                //     if let AppStateEvKind::StrConn(id, conn) = data.data {};
-                // }
+                "listener-offer" => {
+                    if let AppStateEvKind::StrSDPTx(id, offer, tx_ws) = data.data {
+                        let app_state = app_state.lock().await;
+                        if let Some(conn) = app_state.listeners.get(&id) {
+                            let _ = set_offer(id.clone(), conn, offer, tx_ws.clone()).await;
+                        } else {
+                            let id = id.clone();
+                            let tx_ws = tx_ws.clone();
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let _ = new_listener_with_offer(id, offer, tx_ws, tx).await;
+                            });
+                        };
+                    };
+                }
+                "new-listener" => {
+                    if let AppStateEvKind::StrConn(id, conn) = data.data {
+                        {
+                            let id = id.clone();
+                            let mut app_state = app_state.lock().await;
+                            app_state.listeners.insert(id.clone(), conn);
+                            eprintln!("new-listener success");
+                        }
+                        {
+                            let app_state = app_state.clone();
+                            let id = id.clone();
+                            tokio::spawn(async move {
+                                let app_state = app_state.clone();
+                                let mut interval =
+                                    tokio::time::interval(Duration::from_millis(100));
+                                let id = id.clone();
+                                loop {
+                                    interval.tick().await;
+                                    // let _ = intx2.send(true).await;
+                                    let mut app_state = app_state.lock().await;
+                                    let _ = app_state.add_listener_ice_candidates(&id).await;
+                                }
+                            });
+                            eprintln!("Applying ice-candidates for listener");
+                        }
+                        {
+                            let app_state = app_state.lock().await;
+                            let id = id.clone();
+                            app_state.add_tracks_to_listener(id).await;
+                        }
+                    }
+                }
+                "remove-listener" => {
+                    if let AppStateEvKind::Str(id) = data.data {
+                        let mut app_state = app_state.lock().await;
+                        if let Some(conn) = app_state.listeners.get(&id) {
+                            let _ = conn.close().await;
+                            app_state.listeners.remove(&id);
+                        }
+                    }
+                }
+                "listener-answer" => {
+                    if let AppStateEvKind::StrSDP(id, answer) = data.data {
+                        let app_state = app_state.lock().await;
+                        if let Some(conn) = app_state.listeners.get(&id) {
+                            if conn.signaling_state() != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable {
+                                    let _ = conn.set_remote_description(answer).await;
+                                } else {
+                                    eprintln!("signalling state is stable. cannot set answer");
+                                }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
