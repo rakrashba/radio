@@ -113,12 +113,6 @@ fn rtc_config() -> RTCConfiguration {
                 ..Default::default()
             },
             RTCIceServer {
-                urls: vec!["turn:msh22.abhisheksarkar.me:3478".to_owned()],
-                username: "holyshot".to_owned(),
-                credential: "myfckinggawd".to_owned(),
-                credential_type: RTCIceCredentialType::Password,
-            },
-            RTCIceServer {
                 urls: vec!["turn:turn.abhisheksarkar.me:3478".to_owned()],
                 username: "azureturn".to_owned(),
                 credential: "azureturn".to_owned(),
