@@ -10,6 +10,8 @@ use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -111,7 +113,7 @@ fn rtc_config() -> RTCConfiguration {
                 ..Default::default()
             },
             RTCIceServer {
-                urls: vec!["turn:localhost:3478".to_owned()],
+                urls: vec!["turn:localhost:23675".to_owned()],
                 username: "user".to_owned(),
                 credential: "pwd".to_owned(),
                 credential_type: RTCIceCredentialType::Password,
@@ -1042,10 +1044,64 @@ async fn main() -> Result<()> {
         }
     });
 
-    eprintln!("running at 0.0.0.0:29874");
-    axum::Server::bind(&"0.0.0.0:29874".parse().unwrap())
-        .serve(app.into_make_service())
-        .await?;
+    let matches = clap::builder::Command::new("radio")
+        .author("Abhishek Sarkar<rakrashba@outlook.com>")
+        .version("0.0.1")
+        .about("A Hackathon project - my first year @ Microsoft. 2022")
+        .arg(
+            clap::builder::Arg::new("prod")
+                .short('p')
+                .long("prod")
+                .takes_value(false)
+                .help("decides whether to run in prod or local mode"),
+        )
+        .arg(
+            clap::builder::Arg::new("addr")
+                .short('a')
+                .long("addr")
+                .takes_value(true)
+                .value_name("ADDR")
+                .help("address to run this app on"),
+        )
+        .get_matches();
+
+    let mut socket_addr = SocketAddr::from_str(&"0.0.0.0:29874").unwrap();
+    if let Some(addr) = matches.get_one::<String>("addr") {
+        socket_addr = SocketAddr::from_str(addr).unwrap();
+    }
+    let mut tls_config: Option<axum_server::tls_rustls::RustlsConfig> = None;
+    if matches.contains_id("prod") {
+        if let Ok(cert_path) = std::env::var("CERT_PATH") {
+            if let Ok(key_path) = std::env::var("KEY_PATH") {
+                if let Ok(config) = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                    std::path::PathBuf::from(cert_path),
+                    std::path::PathBuf::from(key_path),
+                )
+                .await
+                {
+                    tls_config = Some(config);
+                } else {
+                    eprintln!("error trying to open tls files");
+                }
+            } else {
+                eprintln!("KEY_PATH not set");
+            };
+        } else {
+            eprintln!("CERT_PATH not set");
+        };
+    }
+
+    if let Some(tls_config) = tls_config {
+        eprintln!("running https @: {:?}", &socket_addr);
+        axum_server::bind_rustls(socket_addr, tls_config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        eprintln!("running at {:?}", &socket_addr);
+        axum::Server::bind(&socket_addr)
+            .serve(app.into_make_service())
+            .await?;
+    }
 
     Ok(())
 }
