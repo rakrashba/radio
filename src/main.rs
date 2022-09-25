@@ -113,9 +113,9 @@ fn rtc_config() -> RTCConfiguration {
                 ..Default::default()
             },
             RTCIceServer {
-                urls: vec!["turn:numb.viagenie.ca".to_owned()],
-                username: "webrtc@live.com".to_owned(),
-                credential: "muazkh".to_owned(),
+                urls: vec!["turn:192.158.29.39:3478?transport=tcp".to_owned()],
+                username: "28224511:1379330808".to_owned(),
+                credential: "JZEOEt2V3Qb0y27GRntt2u2PAYA=".to_owned(),
                 credential_type: RTCIceCredentialType::Password,
             },
         ],
