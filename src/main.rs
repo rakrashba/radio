@@ -113,21 +113,9 @@ fn rtc_config() -> RTCConfiguration {
                 ..Default::default()
             },
             RTCIceServer {
-                urls: vec!["turn:192.158.29.39:3478?transport=tcp".to_owned()],
-                username: "28224511:1379330808".to_owned(),
-                credential: "JZEOEt2V3Qb0y27GRntt2u2PAYA=".to_owned(),
-                credential_type: RTCIceCredentialType::Password,
-            },
-            RTCIceServer {
-                urls: vec!["turn:192.158.29.39:3478?transport=udp".to_owned()],
-                username: "28224511:1379330808".to_owned(),
-                credential: "JZEOEt2V3Qb0y27GRntt2u2PAYA=".to_owned(),
-                credential_type: RTCIceCredentialType::Password,
-            },
-            RTCIceServer {
-                urls: vec!["turn:msh22.abhisheksarkar.me:23675".to_owned()],
-                username: "user".to_owned(),
-                credential: "pwd".to_owned(),
+                urls: vec!["turn:msh22.abhisheksarkar.me:3478".to_owned()],
+                username: "holyshot".to_owned(),
+                credential: "myfckinggawd".to_owned(),
                 credential_type: RTCIceCredentialType::Password,
             },
         ],
