@@ -200,6 +200,75 @@ async fn new_peer_conn_with_offer(
         }
     }
 
+    eprintln!("Calling set_offer");
+    set_offer(id.clone(), &peer_conn, offer, tx.clone()).await?;
+    eprintln!("set_offer done");
+
+    let pc = peer_conn.clone();
+    let tx1 = tx.clone();
+    let sid = id.clone();
+    eprintln!("setting up on negotiation needed handler");
+    peer_conn
+        .on_negotiation_needed(Box::new(move || {
+            let pc = pc.clone();
+            let tx1 = tx1.clone();
+            let id = sid.clone();
+            tokio::spawn(async move {
+                if let Ok(offer) = pc.create_offer(None).await {
+                    if pc.signaling_state()
+                        != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+                    {
+                        eprintln!("negotiation needed but state is unstable");
+                        return;
+                    }
+                    if let Ok(_) = pc.set_local_description(offer).await {
+                        if let Some(offer) = pc.local_description().await {
+                            if let Ok(offer) = serde_json::to_string(&offer) {
+                                let msg = Msg {
+                                    ev: "offer".to_owned(),
+                                    id,
+                                    data: offer,
+                                };
+                                if let Ok(value) = serde_json::to_string(&msg) {
+                                    let _ = tx1.send(value).await;
+                                };
+                                println!("negotiation needed. offer set and sent to peer");
+                            };
+                        };
+                    };
+                };
+            });
+            Box::pin(async {})
+        }))
+        .await;
+    eprintln!("on negotiation needed handler ready");
+
+    let sid2 = id.clone();
+    let tx1 = tx.clone();
+    eprintln!("setting up on ice candidate handler");
+    peer_conn
+        .on_ice_candidate(Box::new(move |s| {
+            let sid2 = sid2.clone();
+            let tx1 = tx1.clone();
+            tokio::spawn(async move {
+                if let Some(ice_candidate) = s {
+                    if let Ok(icc) = serde_json::to_string(&ice_candidate) {
+                        let m = Msg {
+                            ev: "ice-candidate".to_owned(),
+                            id: sid2,
+                            data: icc,
+                        };
+                        if let Ok(m) = serde_json::to_string(&m) {
+                            let _ = tx1.send(m).await;
+                        }
+                    };
+                };
+            });
+            Box::pin(async {})
+        }))
+        .await;
+    eprintln!("on ice candidate handler ready");
+
     let (local_track_chan_tx, mut local_track_chan_rx) =
         tokio::sync::mpsc::channel::<Arc<TrackLocalStaticRTP>>(1);
     let local_track_chan_tx = Arc::new(local_track_chan_tx);
@@ -300,75 +369,6 @@ async fn new_peer_conn_with_offer(
         }))
         .await;
 
-    let sid2 = id.clone();
-    let tx1 = tx.clone();
-    eprintln!("setting up on ice candidate handler");
-    peer_conn
-        .on_ice_candidate(Box::new(move |s| {
-            let sid2 = sid2.clone();
-            let tx1 = tx1.clone();
-            tokio::spawn(async move {
-                if let Some(ice_candidate) = s {
-                    if let Ok(icc) = serde_json::to_string(&ice_candidate) {
-                        let m = Msg {
-                            ev: "ice-candidate".to_owned(),
-                            id: sid2,
-                            data: icc,
-                        };
-                        if let Ok(m) = serde_json::to_string(&m) {
-                            let _ = tx1.send(m).await;
-                        }
-                    };
-                };
-            });
-            Box::pin(async {})
-        }))
-        .await;
-    eprintln!("on ice candidate handler ready");
-
-    let pc = peer_conn.clone();
-    let tx1 = tx.clone();
-    let sid = id.clone();
-    eprintln!("setting up on negotiation needed handler");
-    peer_conn
-        .on_negotiation_needed(Box::new(move || {
-            let pc = pc.clone();
-            let tx1 = tx1.clone();
-            let id = sid.clone();
-            tokio::spawn(async move {
-                if let Ok(offer) = pc.create_offer(None).await {
-                    if pc.signaling_state()
-                        != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
-                    {
-                        eprintln!("negotiation needed but state is unstable");
-                        return;
-                    }
-                    if let Ok(_) = pc.set_local_description(offer).await {
-                        if let Some(offer) = pc.local_description().await {
-                            if let Ok(offer) = serde_json::to_string(&offer) {
-                                let msg = Msg {
-                                    ev: "offer".to_owned(),
-                                    id,
-                                    data: offer,
-                                };
-                                if let Ok(value) = serde_json::to_string(&msg) {
-                                    let _ = tx1.send(value).await;
-                                };
-                                println!("negotiation needed. offer set and sent to peer");
-                            };
-                        };
-                    };
-                };
-            });
-            Box::pin(async {})
-        }))
-        .await;
-    eprintln!("on negotiation needed handler ready");
-
-    eprintln!("Calling set_offer");
-    set_offer(id.clone(), &peer_conn, offer, tx.clone()).await?;
-    eprintln!("set_offer done");
-
     eprintln!("waiting to receive tracks");
     let sid = id.clone();
     if let Some(local_track) = local_track_chan_rx.recv().await {
@@ -416,62 +416,9 @@ async fn new_listener_with_offer(
         .await?;
     eprintln!("sent!");
 
-    eprintln!("setting up on peer connection state change handler");
-    let tx_app1 = tx_app.clone();
-    let sid = id.clone();
-    peer_conn
-        .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-            eprintln!("Listener PeerConnection State Changed: {:?}", &s);
-            match s {
-                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
-                    let _ = tx_app1.try_send(AppStateEv{
-                        action: "remove-listener".to_owned(),
-                        data: AppStateEvKind::Str(sid.clone()),
-                    });
-                },
-                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected => {
-                    let _ = tx_app1.try_send(AppStateEv{
-                        action: "remove-listener".to_owned(),
-                        data: AppStateEvKind::Str(sid.clone()),
-                    });
-                },
-                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed => {
-                    let _ = tx_app1.try_send(AppStateEv{
-                        action: "remove-listener".to_owned(),
-                        data: AppStateEvKind::Str(sid.clone()),
-                    });
-                }
-                _ => {}
-            }
-            Box::pin(async {})
-        }))
-        .await;
-
-    let sid2 = id.clone();
-    let tx1 = tx.clone();
-    eprintln!("[listener] setting up on ice candidate handler");
-    peer_conn
-        .on_ice_candidate(Box::new(move |s| {
-            let sid2 = sid2.clone();
-            let tx1 = tx1.clone();
-            tokio::spawn(async move {
-                if let Some(ice_candidate) = s {
-                    if let Ok(icc) = serde_json::to_string(&ice_candidate) {
-                        let m = Msg {
-                            ev: "ice-candidate".to_owned(),
-                            id: sid2,
-                            data: icc,
-                        };
-                        if let Ok(m) = serde_json::to_string(&m) {
-                            let _ = tx1.send(m).await;
-                        }
-                    };
-                };
-            });
-            Box::pin(async {})
-        }))
-        .await;
-    eprintln!("[listener] on ice candidate handler ready");
+    eprintln!("Calling set_offer");
+    set_offer(id.clone(), &peer_conn, offer, tx.clone()).await?;
+    eprintln!("set_offer done");
 
     let pc = peer_conn.clone();
     let tx1 = tx.clone();
@@ -514,9 +461,62 @@ async fn new_listener_with_offer(
         .await;
     eprintln!("[listener] on negotiation needed handler ready");
 
-    eprintln!("Calling set_offer");
-    set_offer(id.clone(), &peer_conn, offer, tx.clone()).await?;
-    eprintln!("set_offer done");
+    let sid2 = id.clone();
+    let tx1 = tx.clone();
+    eprintln!("[listener] setting up on ice candidate handler");
+    peer_conn
+        .on_ice_candidate(Box::new(move |s| {
+            let sid2 = sid2.clone();
+            let tx1 = tx1.clone();
+            tokio::spawn(async move {
+                if let Some(ice_candidate) = s {
+                    if let Ok(icc) = serde_json::to_string(&ice_candidate) {
+                        let m = Msg {
+                            ev: "ice-candidate".to_owned(),
+                            id: sid2,
+                            data: icc,
+                        };
+                        if let Ok(m) = serde_json::to_string(&m) {
+                            let _ = tx1.send(m).await;
+                        }
+                    };
+                };
+            });
+            Box::pin(async {})
+        }))
+        .await;
+    eprintln!("[listener] on ice candidate handler ready");
+
+    eprintln!("setting up on peer connection state change handler");
+    let tx_app1 = tx_app.clone();
+    let sid = id.clone();
+    peer_conn
+        .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+            eprintln!("Listener PeerConnection State Changed: {:?}", &s);
+            match s {
+                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
+                    let _ = tx_app1.try_send(AppStateEv{
+                        action: "remove-listener".to_owned(),
+                        data: AppStateEvKind::Str(sid.clone()),
+                    });
+                },
+                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected => {
+                    let _ = tx_app1.try_send(AppStateEv{
+                        action: "remove-listener".to_owned(),
+                        data: AppStateEvKind::Str(sid.clone()),
+                    });
+                },
+                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed => {
+                    let _ = tx_app1.try_send(AppStateEv{
+                        action: "remove-listener".to_owned(),
+                        data: AppStateEvKind::Str(sid.clone()),
+                    });
+                }
+                _ => {}
+            }
+            Box::pin(async {})
+        }))
+        .await;
 
     Ok(peer_conn)
 }
@@ -658,6 +658,7 @@ impl AppState {
                     if let Some(v) = iccs.pop_front() {
                         if let Ok(candidate) = serde_json::from_str::<RTCIceCandidateInit>(&v) {
                             let _ = conn.add_ice_candidate(candidate).await;
+                            eprintln!("applied ice candidate {}", id);
                         }
                     };
                 }
