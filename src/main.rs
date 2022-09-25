@@ -113,9 +113,9 @@ fn rtc_config() -> RTCConfiguration {
                 ..Default::default()
             },
             RTCIceServer {
-                urls: vec!["turn:localhost:23675".to_owned()],
-                username: "user".to_owned(),
-                credential: "pwd".to_owned(),
+                urls: vec!["turn:numb.viagenie.ca".to_owned()],
+                username: "webrtc@live.com".to_owned(),
+                credential: "muazkh".to_owned(),
                 credential_type: RTCIceCredentialType::Password,
             },
         ],
@@ -1071,7 +1071,9 @@ async fn main() -> Result<()> {
     }
     let mut tls_config: Option<axum_server::tls_rustls::RustlsConfig> = None;
     if matches.contains_id("prod") {
+        // /etc/letsencrypt/live/msh22.abhisheksarkar.me/fullchain.pem
         if let Ok(cert_path) = std::env::var("CERT_PATH") {
+            // /etc/letsencrypt/live/msh22.abhisheksarkar.me/privkey.pem
             if let Ok(key_path) = std::env::var("KEY_PATH") {
                 if let Ok(config) = axum_server::tls_rustls::RustlsConfig::from_pem_file(
                     std::path::PathBuf::from(cert_path),
