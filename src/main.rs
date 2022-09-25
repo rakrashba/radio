@@ -118,6 +118,12 @@ fn rtc_config() -> RTCConfiguration {
                 credential: "myfckinggawd".to_owned(),
                 credential_type: RTCIceCredentialType::Password,
             },
+            RTCIceServer {
+                urls: vec!["turn:openrelay.metered.ca:80".to_owned()],
+                username: "openrelayproject".to_owned(),
+                credential: "openrelayproject".to_owned(),
+                credential_type: RTCIceCredentialType::Password,
+            },
         ],
         ..Default::default()
     }
