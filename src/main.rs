@@ -25,7 +25,8 @@ use webrtc::{
         APIBuilder,
     },
     ice_transport::{
-        ice_candidate::RTCIceCandidateInit, ice_credential_type::RTCIceCredentialType,
+        ice_candidate::{RTCIceCandidate, RTCIceCandidateInit},
+        ice_credential_type::RTCIceCredentialType,
         ice_server::RTCIceServer,
     },
     interceptor::registry::Registry,
@@ -130,12 +131,15 @@ struct AppState {
     speaker_conns: HashMap<String, Arc<RTCPeerConnection>>,
     listeners: HashMap<String, Arc<RTCPeerConnection>>,
     ice_candidates: HashMap<String, VecDeque<String>>,
+    tx: Option<tokio::sync::mpsc::Sender<String>>,
     // ice_candidates_state: HashMap<String, bool>,
 }
 
 async fn add_track_to_conn(
+    id: &str,
     conn: &Arc<RTCPeerConnection>,
     track: &Arc<TrackLocalStaticRTP>,
+    tx: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     for sender in conn.get_senders().await.iter() {
         if let Some(track1) = sender.track().await {
@@ -157,7 +161,64 @@ async fn add_track_to_conn(
         Result::<()>::Ok(())
     });
 
+    // Ice restart
+    let pc = conn.clone();
+    let tx = tx.clone();
+    let id = String::from(id);
+    tokio::spawn(async move {
+        handle_negotiation_needed(id, pc, tx).await;
+    });
+
     Ok(())
+}
+
+async fn handle_negotiation_needed(
+    id: String,
+    pc: Arc<RTCPeerConnection>,
+    tx: tokio::sync::mpsc::Sender<String>,
+) {
+    if let Ok(offer) = pc.create_offer(None).await {
+        if pc.signaling_state()
+            != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+        {
+            eprintln!("negotiation needed but state is unstable");
+            return;
+        }
+        if let Ok(_) = pc.set_local_description(offer).await {
+            if let Some(offer) = pc.local_description().await {
+                if let Ok(offer) = serde_json::to_string(&offer) {
+                    let msg = Msg {
+                        ev: "offer".to_owned(),
+                        id,
+                        data: offer,
+                    };
+                    if let Ok(value) = serde_json::to_string(&msg) {
+                        let _ = tx.send(value).await;
+                    };
+                    println!("negotiation needed. offer set and sent to peer");
+                };
+            };
+        };
+    };
+}
+
+async fn handle_ice_candidate(
+    id: String,
+    s: Option<RTCIceCandidate>,
+    tx: tokio::sync::mpsc::Sender<String>,
+) {
+    if let Some(ice_candidate) = s {
+        if let Ok(icc) = serde_json::to_string(&ice_candidate) {
+            let m = Msg {
+                ev: "ice-candidate".to_owned(),
+                id: id,
+                data: icc,
+            };
+            if let Ok(m) = serde_json::to_string(&m) {
+                let _ = tx.send(m).await;
+            }
+        };
+    };
 }
 
 async fn new_peer_conn_with_offer(
@@ -203,71 +264,6 @@ async fn new_peer_conn_with_offer(
     eprintln!("Calling set_offer");
     set_offer(id.clone(), &peer_conn, offer, tx.clone()).await?;
     eprintln!("set_offer done");
-
-    let pc = peer_conn.clone();
-    let tx1 = tx.clone();
-    let sid = id.clone();
-    eprintln!("setting up on negotiation needed handler");
-    peer_conn
-        .on_negotiation_needed(Box::new(move || {
-            let pc = pc.clone();
-            let tx1 = tx1.clone();
-            let id = sid.clone();
-            tokio::spawn(async move {
-                if let Ok(offer) = pc.create_offer(None).await {
-                    if pc.signaling_state()
-                        != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
-                    {
-                        eprintln!("negotiation needed but state is unstable");
-                        return;
-                    }
-                    if let Ok(_) = pc.set_local_description(offer).await {
-                        if let Some(offer) = pc.local_description().await {
-                            if let Ok(offer) = serde_json::to_string(&offer) {
-                                let msg = Msg {
-                                    ev: "offer".to_owned(),
-                                    id,
-                                    data: offer,
-                                };
-                                if let Ok(value) = serde_json::to_string(&msg) {
-                                    let _ = tx1.send(value).await;
-                                };
-                                println!("negotiation needed. offer set and sent to peer");
-                            };
-                        };
-                    };
-                };
-            });
-            Box::pin(async {})
-        }))
-        .await;
-    eprintln!("on negotiation needed handler ready");
-
-    let sid2 = id.clone();
-    let tx1 = tx.clone();
-    eprintln!("setting up on ice candidate handler");
-    peer_conn
-        .on_ice_candidate(Box::new(move |s| {
-            let sid2 = sid2.clone();
-            let tx1 = tx1.clone();
-            tokio::spawn(async move {
-                if let Some(ice_candidate) = s {
-                    if let Ok(icc) = serde_json::to_string(&ice_candidate) {
-                        let m = Msg {
-                            ev: "ice-candidate".to_owned(),
-                            id: sid2,
-                            data: icc,
-                        };
-                        if let Ok(m) = serde_json::to_string(&m) {
-                            let _ = tx1.send(m).await;
-                        }
-                    };
-                };
-            });
-            Box::pin(async {})
-        }))
-        .await;
-    eprintln!("on ice candidate handler ready");
 
     let (local_track_chan_tx, mut local_track_chan_rx) =
         tokio::sync::mpsc::channel::<Arc<TrackLocalStaticRTP>>(1);
@@ -336,6 +332,38 @@ async fn new_peer_conn_with_offer(
         .await;
     eprintln!("on track handler ready");
 
+    let sid2 = id.clone();
+    let tx1 = tx.clone();
+    eprintln!("setting up on ice candidate handler");
+    peer_conn
+        .on_ice_candidate(Box::new(move |s| {
+            let sid2 = sid2.clone();
+            let tx1 = tx1.clone();
+            tokio::spawn(async move {
+                handle_ice_candidate(sid2, s, tx1).await;
+            });
+            Box::pin(async {})
+        }))
+        .await;
+    eprintln!("on ice candidate handler ready");
+
+    let pc = peer_conn.clone();
+    let tx1 = tx.clone();
+    let sid = id.clone();
+    eprintln!("setting up on negotiation needed handler");
+    peer_conn
+        .on_negotiation_needed(Box::new(move || {
+            let pc = pc.clone();
+            let tx1 = tx1.clone();
+            let id = sid.clone();
+            tokio::spawn(async move {
+                handle_negotiation_needed(id, pc, tx1).await;
+            });
+            Box::pin(async {})
+        }))
+        .await;
+    eprintln!("on negotiation needed handler ready");
+
     // let (connected_tx, _connected_rx) = tokio::sync::mpsc::channel::<bool>(1);
     // let (done_tx, _done_rx) = tokio::sync::mpsc::channel::<bool>(1);
     eprintln!("setting up on peer connection state change handler");
@@ -369,9 +397,10 @@ async fn new_peer_conn_with_offer(
         }))
         .await;
 
-    eprintln!("waiting to receive tracks");
+    eprintln!("waiting to receive track");
     let sid = id.clone();
     if let Some(local_track) = local_track_chan_rx.recv().await {
+        eprintln!("received track");
         let _ = tx_app
             .send(AppStateEv {
                 action: "add-speaker-track".to_owned(),
@@ -431,30 +460,7 @@ async fn new_listener_with_offer(
             let tx1 = tx1.clone();
             let id = sid.clone();
             tokio::spawn(async move {
-                if let Ok(offer) = pc.create_offer(None).await {
-                    if pc.signaling_state()
-                        != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
-                    {
-                        eprintln!("[listener] negotiation needed but state is unstable");
-                        return;
-                    }
-                    eprintln!("[onnegotiationstate] -> setting offer");
-                    if let Ok(_) = pc.set_local_description(offer).await {
-                        if let Some(offer) = pc.local_description().await {
-                            if let Ok(offer) = serde_json::to_string(&offer) {
-                                let msg = Msg {
-                                    ev: "offer".to_owned(),
-                                    id,
-                                    data: offer,
-                                };
-                                if let Ok(value) = serde_json::to_string(&msg) {
-                                    let _ = tx1.send(value).await;
-                                };
-                                println!("negotiation needed. offer set and sent to peer");
-                            };
-                        };
-                    };
-                };
+                handle_negotiation_needed(id, pc, tx1).await;
             });
             Box::pin(async {})
         }))
@@ -469,18 +475,7 @@ async fn new_listener_with_offer(
             let sid2 = sid2.clone();
             let tx1 = tx1.clone();
             tokio::spawn(async move {
-                if let Some(ice_candidate) = s {
-                    if let Ok(icc) = serde_json::to_string(&ice_candidate) {
-                        let m = Msg {
-                            ev: "ice-candidate".to_owned(),
-                            id: sid2,
-                            data: icc,
-                        };
-                        if let Ok(m) = serde_json::to_string(&m) {
-                            let _ = tx1.send(m).await;
-                        }
-                    };
-                };
+                handle_ice_candidate(sid2, s, tx1).await;
             });
             Box::pin(async {})
         }))
@@ -565,6 +560,7 @@ impl AppState {
             speaker_tracks: HashMap::<String, Vec<Arc<TrackLocalStaticRTP>>>::new(),
             speaker_conns: HashMap::<String, Arc<RTCPeerConnection>>::new(),
             ice_candidates: HashMap::<String, VecDeque<String>>::new(),
+            tx: None,
         }
     }
 
@@ -573,48 +569,70 @@ impl AppState {
         id: String,
         track: Arc<TrackLocalStaticRTP>,
     ) -> Result<()> {
-        println!("Adding track: {}", id.clone());
+        println!("Adding track: {}", &id);
         for (id1, conn) in self.speaker_conns.iter() {
             if id.eq(id1) {
                 continue;
             }
 
-            let _ = add_track_to_conn(conn, &track).await;
-            println!("Added track: {} to {}", id.clone(), id1);
+            if let Some(tx) = &self.tx {
+                let tx = tx.clone();
+                let _ = add_track_to_conn(&id, conn, &track, tx).await;
+            }
+
+            println!("Added track: {} to {}", track.id(), id1);
         }
         Ok(())
     }
 
-    async fn add_track_to_listeners(&self, track: Arc<TrackLocalStaticRTP>) {
+    async fn add_track_to_listeners(&self, id: String, track: Arc<TrackLocalStaticRTP>) {
         for (id, conn) in self.listeners.iter() {
             eprintln!("adding track to listener: {}", id);
-            let _ = add_track_to_conn(conn, &track).await;
+            if let Some(tx) = &self.tx {
+                let tx = tx.clone();
+                let _ = add_track_to_conn(&id, conn, &track, tx).await;
+            }
+
             eprintln!("adding track to listener: {} done", id);
         }
     }
 
     async fn add_tracks_to_listener(&self, id: String) {
-        if let Some(conn) = self.listeners.get(&id) {
-            for (_, tracks) in self.speaker_tracks.iter() {
-                for track in tracks.iter() {
-                    eprintln!("adding track to listener: {}", &id);
-                    let _ = add_track_to_conn(conn, track).await;
-                    eprintln!("adding track to listener: {} done", &id);
+        if let Some(tx) = &self.tx {
+            if let Some(conn) = self.listeners.get(&id) {
+                for (_, tracks) in self.speaker_tracks.iter() {
+                    for track in tracks.iter() {
+                        eprintln!("adding track to listener: {}", &id);
+                        let tx = tx.clone();
+                        let _ = add_track_to_conn(&id, conn, track, tx).await;
+                        eprintln!("adding track to listener: {} done", &id);
+                    }
                 }
             }
         }
     }
 
     async fn distribute_tracks_speaker(&self, id: String) -> Result<()> {
-        println!("adding tracks to: {}", id.clone());
-        if let Some(conn) = self.speaker_conns.get(&id) {
-            for (id1, tracks) in self.speaker_tracks.iter() {
-                if id1.eq(&id) {
-                    continue;
-                }
-                for track in tracks.iter() {
-                    let _ = add_track_to_conn(conn, &track).await;
-                    println!("added track: {} to {}", track.id(), id1);
+        println!("[distribute_tracks_speaker] for: {}", id.clone());
+        if let Some(tx) = &self.tx {
+            if let Some(conn) = self.speaker_conns.get(&id) {
+                for (id1, tracks) in self.speaker_tracks.iter() {
+                    if id1.eq(&id) {
+                        continue;
+                    }
+                    eprintln!(
+                        "[distruibute_tracks_speaker] -> handling tracks of: {}",
+                        id1
+                    );
+                    for track in tracks.iter() {
+                        eprintln!("Found track: {}", track.id());
+                        if track.id().starts_with(&id) {
+                            continue;
+                        }
+                        let tx = tx.clone();
+                        let _ = add_track_to_conn(&id, conn, &track, tx).await;
+                        println!("added track: {} to {}", track.id(), &id);
+                    }
                 }
             }
         }
@@ -641,10 +659,10 @@ impl AppState {
                 .await?;
         }
         {
-            self.distribute_tracks_speaker(id.clone()).await?;
+            self.add_track_to_listeners(id.clone(), track.clone()).await;
         }
         {
-            self.add_track_to_listeners(track.clone()).await;
+            self.distribute_tracks_speaker(id.clone()).await?;
         }
 
         Ok(())
@@ -685,6 +703,7 @@ impl AppState {
 
 #[derive(Debug)]
 enum AppStateEvKind {
+    Tx(tokio::sync::mpsc::Sender<String>),
     Str(String),
     StrTrack(String, Arc<TrackLocalStaticRTP>),
     StrConn(String, Arc<RTCPeerConnection>),
@@ -782,6 +801,14 @@ async fn websocket(stream: WebSocket, state: Arc<Context>) {
     let (mut send, mut recv) = stream.split();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+    let tx_app = state.tx.clone();
+    let _ = tx_app
+        .send(AppStateEv {
+            action: "signal-sender".to_owned(),
+            data: AppStateEvKind::Tx(tx.clone()),
+        })
+        .await;
 
     let mut send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -1038,6 +1065,12 @@ async fn main() -> Result<()> {
                                     eprintln!("signalling state is stable. cannot set answer");
                                 }
                         }
+                    }
+                }
+                "signal-sender" => {
+                    if let AppStateEvKind::Tx(tx) = data.data {
+                        let mut app_state = app_state.lock().await;
+                        app_state.tx = Some(tx);
                     }
                 }
                 _ => {}
