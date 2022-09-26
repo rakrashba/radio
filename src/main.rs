@@ -148,9 +148,11 @@ async fn add_track_to_conn(
             }
         };
     }
+    eprintln!("ADDING NEW TRACK TO EXISTING CONN");
     let rtp_sender = conn
         .add_track(Arc::clone(track) as Arc<dyn TrackLocal + Send + Sync>)
         .await?;
+    eprintln!("ADDING NEW TRACK TO EXISTING CONN SUCCESS!!");
 
     // Read incoming RTCP packets
     // Before these packets are returned they are processed by interceptors. For things
@@ -159,14 +161,6 @@ async fn add_track_to_conn(
         let mut rtcp_buf = vec![0u8; 1500];
         while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {}
         Result::<()>::Ok(())
-    });
-
-    // Ice restart
-    let pc = conn.clone();
-    let tx = tx.clone();
-    let id = String::from(id);
-    tokio::spawn(async move {
-        handle_negotiation_needed(id, pc, tx).await;
     });
 
     Ok(())
@@ -271,7 +265,7 @@ async fn new_peer_conn_with_offer(
 
     let sid = id.clone();
     let pc = Arc::downgrade(&peer_conn);
-    eprintln!("setting up on track handler");
+    // eprintln!("setting up on track handler");
     peer_conn
         .on_track(Box::new(
             move |track: Option<Arc<TrackRemote>>, _receiver: Option<Arc<RTCRtpReceiver>>| {
@@ -330,7 +324,7 @@ async fn new_peer_conn_with_offer(
             },
         ))
         .await;
-    eprintln!("on track handler ready");
+    // eprintln!("on track handler ready");
 
     let sid2 = id.clone();
     let tx1 = tx.clone();
@@ -347,7 +341,8 @@ async fn new_peer_conn_with_offer(
         .await;
     eprintln!("on ice candidate handler ready");
 
-    let pc = peer_conn.clone();
+    // let pc = peer_conn.clone();
+    let pc = Arc::downgrade(&peer_conn);
     let tx1 = tx.clone();
     let sid = id.clone();
     eprintln!("setting up on negotiation needed handler");
@@ -357,7 +352,9 @@ async fn new_peer_conn_with_offer(
             let tx1 = tx1.clone();
             let id = sid.clone();
             tokio::spawn(async move {
-                handle_negotiation_needed(id, pc, tx1).await;
+                if let Some(pc) = pc.upgrade() {
+                    handle_negotiation_needed(id, pc, tx1).await;
+                }
             });
             Box::pin(async {})
         }))
@@ -373,12 +370,12 @@ async fn new_peer_conn_with_offer(
         .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             eprintln!("PeerConnection State Changed: {:?}", &s);
             match s {
-                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
-                    let _ = tx_app1.try_send(AppStateEv{
-                        action: "remove-speaker".to_owned(),
-                        data: AppStateEvKind::Str(sid.clone()),
-                    });
-                },
+                // webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
+                //     let _ = tx_app1.try_send(AppStateEv{
+                //         action: "remove-speaker".to_owned(),
+                //         data: AppStateEvKind::Str(sid.clone()),
+                //     });
+                // },
                 webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected => {
                     let _ = tx_app1.try_send(AppStateEv{
                         action: "remove-speaker".to_owned(),
@@ -449,7 +446,7 @@ async fn new_listener_with_offer(
     set_offer(id.clone(), &peer_conn, offer, tx.clone()).await?;
     eprintln!("set_offer done");
 
-    let pc = peer_conn.clone();
+    let pc = Arc::downgrade(&peer_conn);
     let tx1 = tx.clone();
     let sid = id.clone();
     eprintln!("[listener] setting up on negotiation needed handler");
@@ -460,7 +457,9 @@ async fn new_listener_with_offer(
             let tx1 = tx1.clone();
             let id = sid.clone();
             tokio::spawn(async move {
-                handle_negotiation_needed(id, pc, tx1).await;
+                if let Some(pc) = pc.upgrade() {
+                    handle_negotiation_needed(id, pc, tx1).await;
+                }
             });
             Box::pin(async {})
         }))
@@ -489,12 +488,12 @@ async fn new_listener_with_offer(
         .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             eprintln!("Listener PeerConnection State Changed: {:?}", &s);
             match s {
-                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
-                    let _ = tx_app1.try_send(AppStateEv{
-                        action: "remove-listener".to_owned(),
-                        data: AppStateEvKind::Str(sid.clone()),
-                    });
-                },
+                // webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
+                //     let _ = tx_app1.try_send(AppStateEv{
+                //         action: "remove-listener".to_owned(),
+                //         data: AppStateEvKind::Str(sid.clone()),
+                //     });
+                // },
                 webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected => {
                     let _ = tx_app1.try_send(AppStateEv{
                         action: "remove-listener".to_owned(),
@@ -660,9 +659,6 @@ impl AppState {
         }
         {
             self.add_track_to_listeners(id.clone(), track.clone()).await;
-        }
-        {
-            self.distribute_tracks_speaker(id.clone()).await?;
         }
 
         Ok(())
@@ -894,9 +890,11 @@ async fn main() -> Result<()> {
                                 let _ = tx.send(false);
                                 return;
                             }
-                            app_state.speaker_conns.insert(id, conn);
+                            app_state.speaker_conns.insert(id.clone(), conn);
                             let _ = tx.send(true);
+                            let _ = app_state.distribute_tracks_speaker(id).await;
                         }
+
                         {
                             let app_state = app_state.clone();
                             let id = id.clone();
@@ -1021,6 +1019,7 @@ async fn main() -> Result<()> {
                             let mut app_state = app_state.lock().await;
                             app_state.listeners.insert(id.clone(), conn);
                             eprintln!("new-listener success");
+                            app_state.add_tracks_to_listener(id).await;
                         }
                         {
                             let app_state = app_state.clone();
@@ -1038,11 +1037,6 @@ async fn main() -> Result<()> {
                                 }
                             });
                             eprintln!("Applying ice-candidates for listener");
-                        }
-                        {
-                            let app_state = app_state.lock().await;
-                            let id = id.clone();
-                            app_state.add_tracks_to_listener(id).await;
                         }
                     }
                 }
