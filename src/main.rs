@@ -107,9 +107,12 @@ fn rtc_config() -> RTCConfiguration {
             RTCIceServer {
                 urls: vec![
                     "stun:stun.1.google.com:19302".to_owned(),
-                    "stun:stun.2.google.com:19302".to_owned(),
-                    "stun:stun.3.google.com:19302".to_owned(),
-                    "stun:stun.4.google.com:19302".to_owned(),
+                ],
+                ..Default::default()
+            },
+            RTCIceServer {
+                urls: vec![
+                    "stun:turn.abhisheksarkar.me:3478".to_owned(),
                 ],
                 ..Default::default()
             },
