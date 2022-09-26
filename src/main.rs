@@ -106,20 +106,14 @@ fn rtc_config() -> RTCConfiguration {
         ice_servers: vec![
             RTCIceServer {
                 urls: vec![
-                    "stun:stun.1.google.com:19302".to_owned(),
+                    "stun:stun.l.google.com:19302".to_owned(),
                 ],
                 ..Default::default()
             },
             RTCIceServer {
-                urls: vec![
-                    "stun:turn.abhisheksarkar.me:3478".to_owned(),
-                ],
-                ..Default::default()
-            },
-            RTCIceServer {
-                urls: vec!["turn:turn.abhisheksarkar.me:3478".to_owned()],
-                username: "azureturn".to_owned(),
-                credential: "azureturn".to_owned(),
+                urls: vec!["turn:openrelay.metered.ca:80".to_owned()],
+                username: "openrelayproject".to_owned(),
+                credential: "openrelayproject".to_owned(),
                 credential_type: RTCIceCredentialType::Password,
             },
         ],
@@ -1116,9 +1110,7 @@ async fn main() -> Result<()> {
     }
     let mut tls_config: Option<axum_server::tls_rustls::RustlsConfig> = None;
     if matches.contains_id("prod") {
-        // /etc/letsencrypt/live/msh22.abhisheksarkar.me/fullchain.pem
         if let Ok(cert_path) = std::env::var("CERT_PATH") {
-            // /etc/letsencrypt/live/msh22.abhisheksarkar.me/privkey.pem
             if let Ok(key_path) = std::env::var("KEY_PATH") {
                 if let Ok(config) = axum_server::tls_rustls::RustlsConfig::from_pem_file(
                     std::path::PathBuf::from(cert_path),
