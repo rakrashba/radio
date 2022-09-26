@@ -366,16 +366,24 @@ async fn new_peer_conn_with_offer(
     eprintln!("setting up on peer connection state change handler");
     let tx_app1 = tx_app.clone();
     let sid = id.clone();
+    let tx1 = tx.clone();
+    let pc = Arc::downgrade(&peer_conn);
     peer_conn
         .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             eprintln!("PeerConnection State Changed: {:?}", &s);
             match s {
-                // webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
-                //     let _ = tx_app1.try_send(AppStateEv{
-                //         action: "remove-speaker".to_owned(),
-                //         data: AppStateEvKind::Str(sid.clone()),
-                //     });
-                // },
+                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
+                    // ice restart
+                    let id = sid.clone();
+                    let tx = tx1.clone();
+                    let pc = pc.clone();
+                    tokio::spawn(async move{
+                        if let Some(pc) = pc.upgrade() {
+                            handle_negotiation_needed(id, pc, tx).await;
+                        }
+                    });
+                    
+                },
                 webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected => {
                     let _ = tx_app1.try_send(AppStateEv{
                         action: "remove-speaker".to_owned(),
@@ -484,16 +492,22 @@ async fn new_listener_with_offer(
     eprintln!("setting up on peer connection state change handler");
     let tx_app1 = tx_app.clone();
     let sid = id.clone();
+    let tx1 = tx.clone();
+    let pc = Arc::downgrade(&peer_conn);
     peer_conn
         .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             eprintln!("Listener PeerConnection State Changed: {:?}", &s);
             match s {
-                // webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
-                //     let _ = tx_app1.try_send(AppStateEv{
-                //         action: "remove-listener".to_owned(),
-                //         data: AppStateEvKind::Str(sid.clone()),
-                //     });
-                // },
+                webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed => {
+                    let id = sid.clone();
+                    let tx = tx1.clone();
+                    let pc = pc.clone();
+                    tokio::spawn(async move{
+                        if let Some(pc) = pc.upgrade() {
+                            handle_negotiation_needed(id, pc, tx).await;
+                        }
+                    });
+                },
                 webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected => {
                     let _ = tx_app1.try_send(AppStateEv{
                         action: "remove-listener".to_owned(),
