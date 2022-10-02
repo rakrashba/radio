@@ -106,20 +106,14 @@ fn rtc_config() -> RTCConfiguration {
         ice_servers: vec![
             RTCIceServer {
                 urls: vec![
-                    "stun:stun.1.google.com:19302".to_owned(),
+                    "stun:stun.talkcrap.xyz:5349".to_owned(),
                 ],
                 ..Default::default()
             },
             RTCIceServer {
-                urls: vec![
-                    "stun:turn.abhisheksarkar.me:3478".to_owned(),
-                ],
-                ..Default::default()
-            },
-            RTCIceServer {
-                urls: vec!["turn:turn.abhisheksarkar.me:3478".to_owned()],
-                username: "azureturn".to_owned(),
-                credential: "azureturn".to_owned(),
+                urls: vec!["turn:turn.talkcrap.xyz:5349".to_owned()],
+                username: "default".to_owned(),
+                credential: "defaultpwd".to_owned(),
                 credential_type: RTCIceCredentialType::Password,
             },
         ],
@@ -131,6 +125,7 @@ fn rtc_config() -> RTCConfiguration {
 struct AppState {
     max_speakers: usize,
     speaker_tracks: HashMap<String, Vec<Arc<TrackLocalStaticRTP>>>,
+    speaker_stream_ids: HashMap<String, String>,
     speaker_conns: HashMap<String, Arc<RTCPeerConnection>>,
     listeners: HashMap<String, Arc<RTCPeerConnection>>,
     ice_candidates: HashMap<String, VecDeque<String>>,
@@ -139,10 +134,8 @@ struct AppState {
 }
 
 async fn add_track_to_conn(
-    id: &str,
     conn: &Arc<RTCPeerConnection>,
     track: &Arc<TrackLocalStaticRTP>,
-    tx: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     for sender in conn.get_senders().await.iter() {
         if let Some(track1) = sender.track().await {
@@ -304,10 +297,11 @@ async fn new_peer_conn_with_offer(
                     eprintln!("new track from speaker: {}", &sid);
                     tokio::spawn(async move {
                         let rid = uuid::Uuid::new_v4().to_string();
+                        let stream_id = track.stream_id().await;
                         let local_track = Arc::new(TrackLocalStaticRTP::new(
                             track.codec().await.capability,
                             format!("{}-{}", &sid, &rid),
-                            "webrtc-rs".to_owned(),
+                            stream_id,
                         ));
 
                         let _ = local_track_chan_tx2.send(Arc::clone(&local_track)).await;
@@ -574,6 +568,7 @@ impl AppState {
             max_speakers: 5,
             listeners: HashMap::<String, Arc<RTCPeerConnection>>::new(),
             speaker_tracks: HashMap::<String, Vec<Arc<TrackLocalStaticRTP>>>::new(),
+            speaker_stream_ids: HashMap::<String,String>::new(),
             speaker_conns: HashMap::<String, Arc<RTCPeerConnection>>::new(),
             ice_candidates: HashMap::<String, VecDeque<String>>::new(),
             tx: None,
@@ -593,7 +588,7 @@ impl AppState {
 
             if let Some(tx) = &self.tx {
                 let tx = tx.clone();
-                let _ = add_track_to_conn(&id, conn, &track, tx).await;
+                let _ = add_track_to_conn(conn, &track).await;
             }
 
             println!("Added track: {} to {}", track.id(), id1);
@@ -606,7 +601,7 @@ impl AppState {
             eprintln!("adding track to listener: {}", id);
             if let Some(tx) = &self.tx {
                 let tx = tx.clone();
-                let _ = add_track_to_conn(&id, conn, &track, tx).await;
+                let _ = add_track_to_conn(conn, &track).await;
             }
 
             eprintln!("adding track to listener: {} done", id);
@@ -620,7 +615,7 @@ impl AppState {
                     for track in tracks.iter() {
                         eprintln!("adding track to listener: {}", &id);
                         let tx = tx.clone();
-                        let _ = add_track_to_conn(&id, conn, track, tx).await;
+                        let _ = add_track_to_conn(conn, track).await;
                         eprintln!("adding track to listener: {} done", &id);
                     }
                 }
@@ -646,7 +641,7 @@ impl AppState {
                             continue;
                         }
                         let tx = tx.clone();
-                        let _ = add_track_to_conn(&id, conn, &track, tx).await;
+                        let _ = add_track_to_conn(conn, &track).await;
                         println!("added track: {} to {}", track.id(), &id);
                     }
                 }
@@ -666,6 +661,7 @@ impl AppState {
             if let Some(tracks) = self.speaker_tracks.get_mut(&id) {
                 tracks.push(track1);
             } else {
+                self.speaker_stream_ids.insert(id.clone(), String::from(track1.stream_id()));
                 self.speaker_tracks.insert(id.clone(), vec![track1]);
             }
         }
@@ -1116,9 +1112,7 @@ async fn main() -> Result<()> {
     }
     let mut tls_config: Option<axum_server::tls_rustls::RustlsConfig> = None;
     if matches.contains_id("prod") {
-        // /etc/letsencrypt/live/msh22.abhisheksarkar.me/fullchain.pem
         if let Ok(cert_path) = std::env::var("CERT_PATH") {
-            // /etc/letsencrypt/live/msh22.abhisheksarkar.me/privkey.pem
             if let Ok(key_path) = std::env::var("KEY_PATH") {
                 if let Ok(config) = axum_server::tls_rustls::RustlsConfig::from_pem_file(
                     std::path::PathBuf::from(cert_path),
